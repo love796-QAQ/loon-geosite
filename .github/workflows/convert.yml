@@ -19,11 +19,49 @@ jobs:
       run: sudo apt-get install -y jq
 
     - name: Download latest sing-box
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        latest_version=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
-        download_url="https://github.com/SagerNet/sing-box/releases/download/$latest_version/sing-box-${latest_version#v}-linux-amd64.tar.gz"
-        curl -L -o sing-box.tar.gz "$download_url"
-        tar -zxvf sing-box.tar.gz
+        set -euo pipefail
+        release=$(curl --fail --silent --show-error --location \
+          --retry 4 --retry-all-errors --retry-delay 5 --retry-max-time 60 \
+          --connect-timeout 20 --max-time 60 \
+          -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          https://api.github.com/repos/SagerNet/sing-box/releases/latest)
+        latest_version=$(jq -er '.tag_name | select(type == "string" and test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$release") || {
+          echo "::error::The latest release has an invalid or missing version tag" >&2
+          exit 1
+        }
+        asset_name="sing-box-${latest_version#v}-linux-amd64.tar.gz"
+        asset=$(jq -ce --arg name "$asset_name" \
+          '[.assets[] | select(.name == $name and .state == "uploaded")] | if length == 1 then .[0] else error("Expected exactly one uploaded asset: " + $name) end' \
+          <<< "$release")
+        download_url=$(jq -er '.browser_download_url | select(type == "string" and startswith("https://github.com/SagerNet/sing-box/releases/download/"))' <<< "$asset") || {
+          echo "::error::The release asset has an invalid download URL" >&2
+          exit 1
+        }
+        expected_digest=$(jq -er '.digest | select(type == "string" and test("^sha256:[0-9a-f]{64}$")) | sub("^sha256:"; "")' <<< "$asset") || {
+          echo "::error::The release asset has no valid SHA-256 digest" >&2
+          exit 1
+        }
+        for attempt in 1 2 3; do
+          if curl --fail --silent --show-error --location \
+              --retry 2 --retry-all-errors --retry-delay 3 --retry-max-time 30 \
+              --connect-timeout 20 --max-time 120 -o sing-box.tar.gz "$download_url" &&
+             printf '%s  %s\n' "$expected_digest" sing-box.tar.gz | sha256sum --check --status &&
+             tar -tzf sing-box.tar.gz > /dev/null; then
+            break
+          fi
+          rm -f sing-box.tar.gz
+          if [ "$attempt" -eq 3 ]; then
+            echo "::error::Failed to download a valid sing-box archive after three attempts" >&2
+            exit 1
+          fi
+          echo "Download or validation failed; retrying (attempt $((attempt + 1))/3)" >&2
+          sleep $((attempt * 3))
+        done
+        tar -xzf sing-box.tar.gz
         mv "sing-box-${latest_version#v}-linux-amd64/sing-box" /usr/local/bin/  # 移动到可执行路径
 
     - name: Convert .srs files to .txt
@@ -69,4 +107,4 @@ jobs:
         
         git add *.txt
         git commit -m "Convert .srs files to .txt"
-        git push -f https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/love796-QAQ/loon-geosite.git rule-set || echo "Nothing to push"
+        git push -f https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/love796-QAQ/loon-geosite.git rule-set
